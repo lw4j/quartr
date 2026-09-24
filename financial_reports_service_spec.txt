@@ -1,0 +1,879 @@
+Financial Reports Service
+Architecture & Requirements Specification
+
+1. PURPOSE
+
+The Financial Reports Service retrieves financial filings from the U.S. Securities and Exchange Commission (SEC) EDGAR system,
+converts selected filings into PDF documents, and stores them for subsequent use by other applications.
+
+Initial use case:
+Given a list of companies, retrieve the latest available 10-K filing for each company and convert each filing to PDF.
+
+Initial companies:
+- Apple — AAPL
+- Meta Platforms — META
+- Alphabet — GOOGL / GOOG
+- Amazon — AMZN
+- Netflix — NFLX
+- Goldman Sachs — GS
+
+The system must support additional companies and report types without architectural changes.
+
+
+2. DESIGN PRINCIPLES
+
+1. Ticker-oriented public API
+   - Clients identify companies using stock tickers.
+   - The service resolves tickers to SEC CIKs internally.
+
+2. CIK-oriented SEC integration
+   - SEC requests use CIKs, not tickers.
+   - CIK mappings are maintained locally.
+
+3. Logical report paths
+   - A report is identified externally by a logical path such as:
+     /reports/AAPL/10-K/2025
+   - The path represents the requested resource, not a particular SEC filing.
+
+4. Accession IDs identify immutable filings
+   - SEC accession numbers identify the concrete filing/version.
+   - If an amended filing is encountered, it has a different accession ID.
+
+5. Asynchronous processing
+   - Report retrieval and PDF generation are background jobs.
+   - The API should not synchronously download and convert filings.
+
+6. Explicit admission control
+   - The service must prevent unbounded queue growth.
+   - Requests can be rejected when the system has insufficient capacity.
+
+7. SEC-aware request scheduling
+   - All workers must share a global SEC request-rate limit.
+   - Scaling workers must not increase the aggregate SEC request rate.
+
+8. Idempotency
+   - Requesting the same report multiple times should not cause unnecessary downloads or PDF generation.
+
+9. Extensibility
+   - 10-K is the initial report type, but the data model should support 10-Q, 8-K and other filing types later.
+
+
+3. INITIAL FUNCTIONAL REQUIREMENTS
+
+3.1 Companies
+
+The system must support at least:
+- AAPL
+- META
+- GOOGL
+- GOOG
+- AMZN
+- NFLX
+- GS
+
+Multiple tickers may resolve to the same CIK.
+
+The system must not assume that ticker symbols are the canonical SEC identity.
+
+
+3.2 CIK RESOLUTION
+
+The system must maintain a local mapping:
+
+    ticker -> CIK
+
+The SEC publishes a current list of CIKs and entity names, and its submissions API also exposes ticker information for publicly traded companies.
+
+A CIK is a unique SEC filer identifier and is not recycled.
+
+The mapping should be refreshed periodically rather than downloaded for every report request.
+
+Recommended initial implementation:
+
+    SEC CIK mapping
+        -> local persisted mapping
+        -> API lookup
+
+The service should normalize CIKs to the SEC-required 10-digit representation with leading zeroes.
+
+Example:
+
+    CIK 320193
+    -> 0000320193
+
+
+4. REPORT IDENTITY
+
+The external logical identity of a report is:
+
+    /{ticker}/{form}/{year}[/{quarter}]
+
+Examples:
+
+    /reports/AAPL/10-K/2025
+    /reports/AMZN/10-K/2025
+    /reports/META/10-K/2025
+    /reports/AAPL/10-Q/2026/Q1
+
+The initial implementation only needs:
+
+    ticker
+    form = 10-K
+    year
+
+However, the data model should already permit:
+
+    form
+    year
+    quarter
+
+so that 10-Q and other periodic reports can be added later.
+
+The logical path should be treated as the logical key.
+
+
+5. FILING IDENTITY
+
+A logical report path maps to a concrete SEC filing:
+
+    logical report
+        |
+        -> accession number
+
+Example:
+
+    /reports/AAPL/10-K/2025
+        |
+        -> accession = 0000320193-25-xxxxxx
+
+The accession number must be retained with the generated artifact.
+
+The system must never treat the logical path alone as the immutable identity of the downloaded source.
+
+This provides:
+
+    logical report
+        |
+        +-- accession A -> PDF version A
+        |
+        +-- accession B -> PDF version B
+
+This is especially important if an amended filing such as 10-K/A is subsequently submitted.
+
+
+6. DETERMINING THE LATEST 10-K
+
+The service should use the SEC submissions history for the company's CIK.
+
+The SEC provides:
+
+    https://data.sec.gov/submissions/CIK##########.json
+
+The response contains filing history including form type, filing date, accession number, and primary document information.
+
+For the initial implementation:
+
+1. Resolve ticker -> CIK.
+2. Retrieve the company's submissions JSON.
+3. Examine recent filings.
+4. Select the latest applicable 10-K.
+5. Record:
+   - CIK
+   - ticker
+   - form
+   - filing date
+   - accession number
+   - primary document
+   - SEC filing URL
+6. Download the filing.
+7. Convert it to PDF.
+8. Store the resulting artifact.
+
+The selection logic must be explicit about amendments.
+
+Initial policy:
+
+The default report selector means:
+"Latest filed 10-K, excluding 10-K/A unless the caller explicitly requests amended filings."
+
+This policy should be represented as configuration rather than hard-coded into the storage model.
+
+Future report selectors could include:
+- 10-K
+- 10-K/A
+- 10-Q
+- 10-Q/A
+- 8-K
+- 20-F
+
+
+7. SEC DATA ACQUISITION
+
+The system should use SEC's official EDGAR interfaces.
+
+For company filing discovery, the primary interface is:
+
+    https://data.sec.gov/submissions/CIK##########.json
+
+The submissions API is updated as filings are disseminated and is intended for programmatic access.
+
+The actual filing documents are available through the SEC EDGAR archive.
+
+The service should download only the files required to construct the requested report.
+
+It should not crawl an entire company's filing history or recursively crawl EDGAR.
+
+The SEC explicitly recommends efficient scripted access and downloading only what is needed.
+
+
+
+8. PDF GENERATION
+
+SEC filings are not necessarily supplied as PDFs.
+
+The acquisition pipeline should therefore treat:
+
+    SEC filing
+        -> source document(s)
+        -> PDF conversion
+        -> stored PDF
+
+as two separate stages.
+
+The service should preserve the original SEC source where practical, at least temporarily during processing, so that PDF generation can be repeated without another SEC request.
+
+The resulting PDF should contain metadata identifying its source:
+
+- ticker
+- company name
+- CIK
+- form
+- filing date
+- accession number
+- SEC primary document
+- source URL
+- generation timestamp
+
+
+9. STORAGE MODEL
+
+The storage layout should distinguish logical identity from immutable filing identity.
+
+Conceptually:
+
+    reports/
+        AAPL/
+            10-K/
+                2025/
+                    current
+                    accession-0000320193-25-xxxxxx/
+                        filing.*
+                        report.pdf
+                        metadata.json
+
+The exact physical storage backend is intentionally unspecified.
+
+Requirements:
+- logical report lookup must be fast;
+- accession-based artifacts must be immutable;
+- generated PDFs must be addressable;
+- metadata must be stored alongside the artifact.
+
+A database or Redis record(for demo purposes) should maintain the current mapping:
+
+    logical_path
+        -> current_accession
+        -> artifact
+
+
+10. API
+
+The API should be asynchronous.
+
+Example request:
+
+    POST /reports
+    Content-Type: application/json
+
+    {
+      "ticker": "AAPL",
+      "form": "10-K",
+      "year": 2025
+    }
+
+For the initial "latest 10-K" operation, an explicit year may be omitted:
+
+    POST /reports
+    Content-Type: application/json
+
+    {
+      "ticker": "AAPL",
+      "form": "10-K"
+    }
+
+The service then resolves the latest applicable filing.
+
+Possible responses:
+
+Already available:
+
+    200 OK
+
+Processing required:
+
+    202 Accepted
+
+The response should include a task/report identifier.
+
+System overloaded:
+
+    429 Too Many Requests
+
+The response should communicate that the client should retry later, preferably using Retry-After.
+
+The API should not block while waiting for SEC retrieval and PDF generation.
+
+
+11. QUEUE ARCHITECTURE
+
+The service should use Redis Streams for the work queue.
+
+Conceptually:
+
+                         +--------------+
+                         |   FastAPI    |
+                         +------+-------+
+                                |
+                         admission control
+                                |
+                                v
+                         Redis Stream
+                         reports:tasks
+                                |
+                    +-----------+-----------+
+                    |           |           |
+                    v           v           v
+                 Worker 1    Worker 2    Worker N
+                    |           |           |
+                    +-----------+-----------+
+                                |
+                                v
+                               SEC
+
+Redis Streams are preferred over Redis Pub/Sub because report-generation jobs must not disappear if a worker is unavailable.
+
+The stream provides persistent queued messages, consumer groups, acknowledgements and pending-message tracking.
+
+Pub/Sub may be added later for transient notifications, but should not be the primary work queue.
+
+
+12. QUEUE STATE
+
+Each report/task should have an explicit state machine.
+
+Initial states:
+
+    accepted
+    queued
+    processing
+    completed
+    failed
+
+Potential future states:
+
+    retrying
+    cancelled
+
+Example:
+
+    accepted
+       |
+       v
+    queued
+       |
+       v
+    processing
+       +--------------> completed
+       |
+       +-- failure ---> retrying
+                            |
+                            +--> queued
+
+The API must be able to determine whether a requested report is:
+- already available;
+- currently being processed;
+- queued;
+- failed;
+- or not yet requested.
+
+
+13. IDEMPOTENCY AND DEDUPLICATION
+
+A logical report path should be unique:
+
+    /ticker/form/year[/quarter]
+
+If multiple clients request:
+
+    /reports/AAPL/10-K/2025
+
+while it is being processed, the service should create one job, not one job per request.
+
+Conceptually:
+
+    Request 1 --+
+    Request 2 --+--> same logical report --> one task
+    Request 3 --+
+
+This prevents duplicate SEC requests and unnecessary PDF conversion.
+
+The accession number should also participate in deduplication of the actual source artifact.
+
+
+14. BACKPRESSURE
+
+The API must impose an upper bound on accepted work.
+
+The system must not allow clients to enqueue unlimited reports.
+
+Conceptually:
+
+             queue capacity
+                  |
+                  v
+Client -> API -> admission control -> Redis Stream
+                  |
+                  +-- capacity available -> accept
+                  |
+                  +-- capacity exhausted -> 429
+
+The initial implementation may use:
+
+    MAX_QUEUE_DEPTH
+
+as a simple admission-control threshold.
+
+However, queue depth should be treated as an approximation of capacity rather than a perfect measurement of system load.
+
+The design should leave room for more sophisticated admission control based on:
+- queue depth;
+- active workers;
+- estimated processing time;
+- SEC rate-limit availability.
+
+
+15. SEC RATE LIMITING
+
+SEC fair-access requirements are a first-class system requirement.
+
+The SEC currently states a maximum request rate of 10 requests per second and explicitly asks automated clients to moderate requests and download only what is necessary.
+
+The rate limit applies to the service as a whole, not individually per worker.
+
+Therefore:
+
+    Worker 1 --+
+    Worker 2 --+
+    Worker 3 --+--> GLOBAL SEC RATE LIMITER --> SEC
+    Worker N --+
+
+must be used rather than:
+
+    Worker 1 -> 10 req/s
+    Worker 2 -> 10 req/s
+    Worker 3 -> 10 req/s
+
+The latter could unintentionally generate excessive aggregate traffic.
+
+Recommended implementation:
+
+Use a centralized Redis-backed rate limiter so that scaling workers does not bypass the limit.
+
+The configured limit should be below the SEC maximum, leaving safety margin.
+
+The limiter should also handle:
+- HTTP 429;
+- transient network errors;
+- retry delays;
+- exponential backoff;
+- jitter.
+
+
+16. SEC USER-AGENT
+
+Every automated request must identify the client with a descriptive User-Agent.
+
+The SEC asks scripted clients to declare their User-Agent, including an identifying application/company name and contact email.
+
+The service should therefore configure a single explicit value, for example:
+
+    User-Agent: FinancialReportsService/1.0 admin@example.com
+
+The actual production value should identify the responsible organization and a monitored contact address.
+
+This configuration must not be optional in production.
+
+
+17. HTTP CACHING
+
+The SEC API documentation indicates that some resources provide HTTP caching metadata such as:
+- ETag
+- Last-Modified
+- Cache-Control
+
+Clients should use these mechanisms where applicable.
+
+The SEC client should therefore support conditional requests where useful.
+
+This reduces unnecessary data transfer and SEC load.
+
+
+18. RETRY POLICY
+
+Retries should distinguish between transient and permanent failures.
+
+Retryable examples:
+- 429 Too Many Requests
+- 5xx responses
+- connection timeout
+- temporary DNS/network failure
+- temporary SEC availability problem
+
+Non-retryable examples:
+- invalid CIK
+- ticker not found
+- requested filing does not exist
+- unsupported filing type
+- invalid request
+
+Retries should use exponential backoff with jitter.
+
+A failed worker must not cause a report to disappear permanently from the queue.
+
+
+19. WORKER PROCESSING
+
+A worker should roughly execute:
+
+1. Read task from Redis Stream.
+2. Resolve ticker -> CIK.
+3. Query SEC submissions history.
+4. Select applicable filing.
+5. Check whether accession is already stored.
+6. Download required SEC source document(s).
+7. Convert filing to PDF.
+8. Validate generated PDF.
+9. Store PDF and metadata.
+10. Update report state.
+11. ACK Redis Stream message.
+
+The worker should only acknowledge the queue message after the result has been safely persisted.
+
+
+20. FAILURE RECOVERY
+
+If a worker crashes after receiving a task but before acknowledging it:
+
+    Redis
+      |
+      +-- pending task
+
+The system must be able to detect and reclaim the task.
+
+A future worker should be able to claim abandoned tasks after an appropriate timeout.
+
+This is one of the reasons Redis Streams is preferable to Pub/Sub for the core work queue.
+
+
+21. DOCKER COMPOSE DEPLOYMENT
+
+The initial deployment should use Docker Compose.
+
+Conceptually:
+
+    docker-compose
+    |
+    +-- api
+    |   +-- FastAPI
+    |
+    +-- redis
+    |   +-- task stream
+    |   +-- task state
+    |   +-- rate limiter
+    |
+    +-- worker
+    |   +-- report processing
+    |
+    +-- storage
+        +-- generated reports
+
+Workers should be independently scalable:
+
+    docker compose up --scale worker=N
+
+Increasing worker count must not increase the aggregate SEC request rate because the SEC rate limiter is global.
+
+
+22. INITIAL WORKFLOW
+
+For the initial requirement:
+
+"Fetch the latest 10-K for Apple, Meta, Alphabet, Amazon, Netflix and Goldman Sachs."
+
+The system should perform:
+
+    AAPL --+
+    META --+
+    GOOGL -+
+    AMZN --+
+    NFLX --+
+    GS ----+
+           |
+           v
+      ticker -> CIK
+           |
+           v
+    SEC submissions API
+           |
+           v
+    latest applicable 10-K
+           |
+           v
+      accession number
+           |
+           v
+    SEC filing document
+           |
+           v
+       PDF conversion
+           |
+           v
+      persistent storage
+
+The six requests should not necessarily generate six simultaneous SEC downloads. They should pass through the common queue and SEC rate limiter.
+
+
+23. FUTURE EXTENSIBILITY
+
+The architecture must support future requests such as:
+
+    /reports/AAPL/10-K/2025
+    /reports/AAPL/10-Q/2026/Q1
+    /reports/AAPL/10-Q/2026/Q2
+    /reports/META/10-K/2025
+    /reports/NFLX/8-K/2026
+
+Potential future report traits include:
+- form
+- year
+- quarter
+- amended/non-amended
+- filing date
+- accession
+
+The API and storage model should therefore not contain 10-K-specific assumptions beyond the initial filing-selection logic.
+
+
+24. NON-FUNCTIONAL REQUIREMENTS
+
+24.1 Reliability
+
+- No accepted task should be silently lost.
+- Worker crashes must be recoverable.
+- Completed artifacts must be immutable by accession.
+- Duplicate requests must not cause duplicate processing.
+
+24.2 Performance
+
+- API requests should return quickly.
+- SEC retrieval and PDF conversion must be asynchronous.
+- Multiple workers should be supported.
+- Queue admission should prevent uncontrolled backlog.
+
+24.3 SEC compliance
+
+- Respect the SEC's published request-rate limits.
+- Use a descriptive User-Agent.
+- Minimize unnecessary requests.
+- Do not crawl EDGAR indiscriminately.
+- Use official SEC APIs and archives.
+- Handle 429 responses appropriately.
+- Apply aggregate rate limiting across all workers.
+
+The SEC explicitly states that the current maximum access rate is 10 requests/second and that limits apply across machines used by a client.
+
+24.4 Observability
+
+The service should expose at least:
+
+    queue depth
+    active workers
+    jobs accepted
+    jobs completed
+    jobs failed
+    jobs retried
+    SEC requests
+    SEC 429 responses
+    SEC request latency
+    PDF conversion latency
+
+Structured logs should include:
+
+    task_id
+    logical_report_path
+    ticker
+    CIK
+    form
+    accession
+    worker_id
+    state
+
+
+25. SUGGESTED COMPONENT BOUNDARIES
+
+    api/
+        HTTP API
+        admission control
+
+    companies/
+        ticker -> CIK mapping
+
+    sec/
+        SEC HTTP client
+        submissions API
+        filing discovery
+        rate limiting
+        retry handling
+
+    reports/
+        report identity
+        filing selection
+        report state
+
+    queue/
+        Redis Streams
+        consumer groups
+        acknowledgement
+        recovery
+
+    conversion/
+        SEC source -> PDF
+
+    storage/
+        PDF artifacts
+        source artifacts
+        metadata
+
+    workers/
+        orchestration of the above components
+
+This separation should make it possible to change the queue, storage backend or PDF converter without changing the SEC integration or public API.
+
+
+26. INITIAL IMPLEMENTATION SCOPE
+
+Must have:
+- FastAPI service
+- ticker -> CIK mapping
+- CIK normalization
+- SEC submissions API client
+- latest 10-K discovery
+- accession-number handling
+- SEC filing download
+- HTML/source -> PDF conversion
+- persistent PDF storage
+- Redis Streams queue
+- worker process
+- task state
+- duplicate-job prevention
+- queue admission/backpressure
+- global SEC rate limiter
+- SEC-compliant User-Agent
+- retries/backoff
+- worker failure recovery
+
+Initial companies:
+- AAPL
+- META
+- GOOGL / GOOG
+- AMZN
+- NFLX
+- GS
+
+Initial report:
+- 10-K
+
+Explicitly deferred:
+- 10-Q
+- 8-K
+- arbitrary filing types
+- XBRL financial-data extraction
+- complex task workflows
+- scheduled automatic report refresh
+- public report-serving API
+- full-text search
+- financial-data normalization
+
+The underlying architecture should nevertheless avoid preventing these future capabilities.
+
+
+27. ARCHITECTURAL SUMMARY
+
+The fundamental flow is:
+
+    Client
+      |
+      v
+    FastAPI
+      |
+      +-- validation
+      +-- ticker -> CIK lookup
+      +-- deduplication
+      +-- admission control
+      |
+      v
+    Redis
+      |
+      +-- report state
+      +-- Redis Stream
+      +-- rate limiter
+      |
+      v
+    Workers
+      |
+      +-- filing discovery
+      +-- SEC rate limiting
+      +-- SEC download
+      +-- PDF conversion
+      +-- artifact persistence
+      |
+      v
+    Storage
+
+The fundamental identifiers are:
+
+    Ticker
+       |
+       v
+    CIK
+       |
+       v
+    Logical report path
+       |
+       v
+    SEC accession number
+       |
+       v
+    Immutable source filing
+       |
+       v
+    Generated PDF
+
+This gives a clean separation between:
+- what the client requests;
+- which SEC entity owns the filing;
+- which exact filing was retrieved;
+- which generated artifact is stored.
+
+28. Implementation specifics
+- Use python for all components of the system.

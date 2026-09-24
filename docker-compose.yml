@@ -1,0 +1,62 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    restart: unless-stopped
+    command: ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      SEC_USER_AGENT: "${SEC_USER_AGENT:-FinancialReportsService/1.0 (dev; admin@example.com)}"
+      MAX_QUEUE_DEPTH: "${MAX_QUEUE_DEPTH:-1000}"
+      SEC_RATE_LIMIT_PER_SECOND: "${SEC_RATE_LIMIT_PER_SECOND:-8}"
+      STORAGE_ROOT: /data/reports
+      CIK_MAPPING_PATH: /data/cik_mapping.json
+      ENVIRONMENT: development
+    volumes:
+      - ./reports-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.main"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      SEC_USER_AGENT: "${SEC_USER_AGENT:-FinancialReportsService/1.0 (dev; admin@example.com)}"
+      MAX_QUEUE_DEPTH: "${MAX_QUEUE_DEPTH:-1000}"
+      SEC_RATE_LIMIT_PER_SECOND: "${SEC_RATE_LIMIT_PER_SECOND:-8}"
+      WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-1}"
+      WORKER_METRICS_PORT: "9100"
+      STORAGE_ROOT: /data/reports
+      CIK_MAPPING_PATH: /data/cik_mapping.json
+      ENVIRONMENT: development
+    volumes:
+      - ./reports-data:/data
+    # Host-port range rather than a single port, so `--scale worker=N` can
+    # still bind each replica's metrics endpoint.
+    ports:
+      - "9100-9109:9100"
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 1  # override with: docker compose up --scale worker=N
+
+volumes:
+  redis-data:

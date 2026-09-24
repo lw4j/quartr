@@ -1,0 +1,31 @@
+# The image only needs requirements.txt and app/ (see Dockerfile), but the
+# whole directory is still sent to the daemon as the build context. The
+# runtime bind mount ./reports-data grows with every filing fetched, so
+# without this a rebuild after a few runs ships hundreds of MB of PDFs and
+# cached SEC source documents to the daemon for nothing.
+
+.git
+.gitignore
+.dockerignore
+
+# Generated at runtime.
+reports-data/
+data/
+pdfs/
+*.pdf
+
+# Python caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+
+# Not used by the image.
+tests/
+scripts/
+docker-compose.yml
+requirements-dev.txt
+README.md
+LICENSE
+*_spec.txt
